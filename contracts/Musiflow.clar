@@ -10,10 +10,15 @@
 (define-constant ERR_SUBSCRIPTION_EXPIRED (err u108))
 (define-constant ERR_INVALID_DURATION (err u109))
 (define-constant ERR_SUBSCRIPTION_ALREADY_EXISTS (err u110))
+(define-constant ERR_INSUFFICIENT_POINTS (err u111))
+(define-constant ERR_REWARD_NOT_FOUND (err u112))
+(define-constant ERR_REWARD_UNAVAILABLE (err u113))
+(define-constant ERR_INVALID_POINTS (err u114))
 
 (define-data-var next-stream-id uint u1)
 (define-data-var platform-fee-percentage uint u250)
 (define-data-var next-subscription-id uint u1)
+(define-data-var next-reward-id uint u1)
 
 (define-map streams
   uint
@@ -88,6 +93,65 @@
 (define-map subscription-revenue
   { artist: principal, period: uint }
   { total-revenue: uint, subscriber-count: uint }
+)
+
+(define-map fan-points
+  principal
+  { 
+    total-points: uint,
+    current-points: uint,
+    points-earned-today: uint,
+    last-activity-block: uint,
+    level: uint,
+    lifetime-spent: uint
+  }
+)
+
+(define-map artist-rewards
+  { artist: principal, reward-id: uint }
+  {
+    reward-type: (string-ascii 50),
+    points-cost: uint,
+    max-redemptions: uint,
+    current-redemptions: uint,
+    is-active: bool,
+    description: (string-ascii 200),
+    expires-at-block: uint
+  }
+)
+
+(define-map reward-redemptions
+  { fan: principal, reward-id: uint, artist: principal }
+  {
+    redeemed-at-block: uint,
+    redemption-id: uint
+  }
+)
+
+(define-map fan-levels
+  uint
+  {
+    level-name: (string-ascii 30),
+    points-required: uint,
+    daily-bonus-multiplier: uint
+  }
+)
+
+(define-map fan-activity-log
+  { fan: principal, activity-block: uint }
+  {
+    activity-type: (string-ascii 30),
+    points-earned: uint,
+    related-stream-id: uint
+  }
+)
+
+(define-map daily-leaderboard
+  { date: uint, rank: uint }
+  {
+    fan: principal,
+    points-earned: uint
+  }
 )
 
 (define-public (create-stream (title (string-ascii 100)) (collaborator-list (list 10 principal)) (percentages (list 10 uint)))
@@ -171,6 +235,7 @@
       { amount: amount, timestamp: stacks-block-height }
     )
     
+    (unwrap-panic (award-points-for-activity tx-sender "revenue-deposit" (/ amount u1000000) stream-id))
     (ok net-amount)
   )
 )
@@ -334,6 +399,7 @@
     )
     
     (try! (distribute-subscription-revenue artist artist-amount))
+    (unwrap-panic (award-points-for-activity tx-sender "subscription" u50 u0))
     
     (var-set next-subscription-id (+ subscription-id u1))
     (ok subscription-id)
@@ -465,3 +531,196 @@
 (define-read-only (get-subscription-revenue (artist principal) (period uint))
   (map-get? subscription-revenue { artist: artist, period: period })
 )
+
+(define-private (award-points-for-activity (fan principal) (activity-type (string-ascii 30)) (base-points uint) (stream-id uint))
+  (let
+    (
+      (current-data (default-to { total-points: u0, current-points: u0, points-earned-today: u0, last-activity-block: u0, level: u1, lifetime-spent: u0 } 
+                                (map-get? fan-points fan)))
+      (is-same-day (is-eq (/ stacks-block-height u144) (/ (get last-activity-block current-data) u144)))
+      (daily-points (if is-same-day (get points-earned-today current-data) u0))
+      (level-data (default-to { level-name: "Bronze", points-required: u0, daily-bonus-multiplier: u100 } 
+                              (map-get? fan-levels (get level current-data))))
+      (bonus-multiplier (get daily-bonus-multiplier level-data))
+      (final-points (/ (* base-points bonus-multiplier) u100))
+      (new-total-points (+ (get total-points current-data) final-points))
+      (new-current-points (+ (get current-points current-data) final-points))
+      (new-daily-points (+ daily-points final-points))
+      (new-level (calculate-level new-total-points))
+    )
+    (map-set fan-points fan {
+      total-points: new-total-points,
+      current-points: new-current-points,
+      points-earned-today: new-daily-points,
+      last-activity-block: stacks-block-height,
+      level: new-level,
+      lifetime-spent: (get lifetime-spent current-data)
+    })
+    
+    (map-set fan-activity-log 
+      { fan: fan, activity-block: stacks-block-height }
+      { activity-type: activity-type, points-earned: final-points, related-stream-id: stream-id }
+    )
+    
+    (ok final-points)
+  )
+)
+
+(define-private (calculate-level (total-points uint))
+  (if (< total-points u500) u1
+    (if (< total-points u1500) u2
+      (if (< total-points u5000) u3
+        (if (< total-points u15000) u4
+          u5
+        )
+      )
+    )
+  )
+)
+
+(define-public (create-artist-reward (reward-type (string-ascii 50)) (points-cost uint) (max-redemptions uint) (description (string-ascii 200)) (expires-in-blocks uint))
+  (let
+    (
+      (reward-id (var-get next-reward-id))
+      (expires-at (+ stacks-block-height expires-in-blocks))
+    )
+    (asserts! (> points-cost u0) ERR_INVALID_POINTS)
+    (asserts! (> max-redemptions u0) ERR_INVALID_AMOUNT)
+    
+    (map-set artist-rewards 
+      { artist: tx-sender, reward-id: reward-id }
+      {
+        reward-type: reward-type,
+        points-cost: points-cost,
+        max-redemptions: max-redemptions,
+        current-redemptions: u0,
+        is-active: true,
+        description: description,
+        expires-at-block: expires-at
+      }
+    )
+    
+    (var-set next-reward-id (+ reward-id u1))
+    (ok reward-id)
+  )
+)
+
+(define-public (redeem-reward (artist principal) (reward-id uint))
+  (let
+    (
+      (fan-data (unwrap! (map-get? fan-points tx-sender) ERR_NOT_FOUND))
+      (reward (unwrap! (map-get? artist-rewards { artist: artist, reward-id: reward-id }) ERR_REWARD_NOT_FOUND))
+      (points-cost (get points-cost reward))
+      (current-points (get current-points fan-data))
+    )
+    (asserts! (get is-active reward) ERR_REWARD_UNAVAILABLE)
+    (asserts! (< stacks-block-height (get expires-at-block reward)) ERR_REWARD_UNAVAILABLE)
+    (asserts! (< (get current-redemptions reward) (get max-redemptions reward)) ERR_REWARD_UNAVAILABLE)
+    (asserts! (>= current-points points-cost) ERR_INSUFFICIENT_POINTS)
+    
+    (map-set fan-points tx-sender 
+      (merge fan-data { 
+        current-points: (- current-points points-cost),
+        lifetime-spent: (+ (get lifetime-spent fan-data) points-cost)
+      })
+    )
+    
+    (map-set artist-rewards 
+      { artist: artist, reward-id: reward-id }
+      (merge reward { current-redemptions: (+ (get current-redemptions reward) u1) })
+    )
+    
+    (map-set reward-redemptions 
+      { fan: tx-sender, reward-id: reward-id, artist: artist }
+      { redeemed-at-block: stacks-block-height, redemption-id: reward-id }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (initialize-fan-levels)
+  (begin
+    (map-set fan-levels u1 { level-name: "Bronze", points-required: u0, daily-bonus-multiplier: u100 })
+    (map-set fan-levels u2 { level-name: "Silver", points-required: u500, daily-bonus-multiplier: u110 })
+    (map-set fan-levels u3 { level-name: "Gold", points-required: u1500, daily-bonus-multiplier: u125 })
+    (map-set fan-levels u4 { level-name: "Platinum", points-required: u5000, daily-bonus-multiplier: u150 })
+    (map-set fan-levels u5 { level-name: "Diamond", points-required: u15000, daily-bonus-multiplier: u200 })
+    (ok true)
+  )
+)
+
+(define-public (update-daily-leaderboard (date uint))
+  (let
+    (
+      (fan-data (unwrap! (map-get? fan-points tx-sender) ERR_NOT_FOUND))
+      (daily-points (get points-earned-today fan-data))
+    )
+    (asserts! (> daily-points u0) ERR_INVALID_POINTS)
+    
+    (map-set daily-leaderboard 
+      { date: date, rank: u1 }
+      { fan: tx-sender, points-earned: daily-points }
+    )
+    
+    (ok daily-points)
+  )
+)
+
+(define-public (claim-daily-bonus)
+  (let
+    (
+      (fan-data (unwrap! (map-get? fan-points tx-sender) ERR_NOT_FOUND))
+      (last-claim-day (/ (get last-activity-block fan-data) u144))
+      (current-day (/ stacks-block-height u144))
+      (level-data (default-to { level-name: "Bronze", points-required: u0, daily-bonus-multiplier: u100 } 
+                              (map-get? fan-levels (get level fan-data))))
+      (daily-bonus (/ (* u25 (get daily-bonus-multiplier level-data)) u100))
+    )
+    (asserts! (> current-day last-claim-day) ERR_INVALID_AMOUNT)
+    
+    (unwrap-panic (award-points-for-activity tx-sender "daily-bonus" daily-bonus u0))
+    
+    (ok daily-bonus)
+  )
+)
+
+(define-read-only (get-fan-points (fan principal))
+  (map-get? fan-points fan)
+)
+
+(define-read-only (get-artist-reward (artist principal) (reward-id uint))
+  (map-get? artist-rewards { artist: artist, reward-id: reward-id })
+)
+
+(define-read-only (get-fan-level (level uint))
+  (map-get? fan-levels level)
+)
+
+(define-read-only (get-fan-activity (fan principal) (activity-block uint))
+  (map-get? fan-activity-log { fan: fan, activity-block: activity-block })
+)
+
+(define-read-only (get-daily-leaderboard-entry (date uint) (rank uint))
+  (map-get? daily-leaderboard { date: date, rank: rank })
+)
+
+(define-read-only (get-reward-redemption (fan principal) (reward-id uint) (artist principal))
+  (map-get? reward-redemptions { fan: fan, reward-id: reward-id, artist: artist })
+)
+
+(define-read-only (calculate-fan-rank (fan principal))
+  (match (map-get? fan-points fan)
+    fan-data
+      (let
+        (
+          (total-points (get total-points fan-data))
+          (level (get level fan-data))
+        )
+        (ok { total-points: total-points, level: level, rank: (+ level total-points) })
+      )
+    ERR_NOT_FOUND
+  )
+)
+
+

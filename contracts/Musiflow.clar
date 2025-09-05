@@ -236,6 +236,7 @@
     )
     
     (unwrap-panic (award-points-for-activity tx-sender "revenue-deposit" (/ amount u1000000) stream-id))
+    (unwrap-panic (track-revenue (get artist stream) net-amount))
     (ok net-amount)
   )
 )
@@ -720,6 +721,19 @@
         (ok { total-points: total-points, level: level, rank: (+ level total-points) })
       )
     ERR_NOT_FOUND
+  )
+)
+
+;; Analytics tracking helpers
+(define-private (track-revenue (artist principal) (amount uint))
+  (let ((month-id (/ stacks-block-height u4320))) ;; Approximate monthly blocks
+    (contract-call? .musiflow-analytics record-revenue artist month-id amount)
+  )
+)
+
+(define-private (track-activity (artist principal) (plays uint) (likes uint) (purchases uint))
+  (let ((month-id (/ stacks-block-height u4320)))
+    (contract-call? .musiflow-analytics record-fan-activity artist month-id plays likes purchases)
   )
 )
 
